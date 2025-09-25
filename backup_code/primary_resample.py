@@ -318,86 +318,50 @@ class PrivateDEGeneratorPT:
         return torch.all(cond, dim=1)
 
     def _calculate_linf_fitness_single_device(self, data_pt: torch.Tensor, error_pt: torch.Tensor, q_I_pt: torch.Tensor,
-                                            q_L_pt: torch.Tensor, q_U_pt: torch.Tensor, batch_size_records: int,
-                                            query_chunk_size: int) -> torch.Tensor:
-        """
-        计算每条记录的“符号占优和”行级适应度（签名不变）：
-        - 对每条记录，只累计其命中的查询：
-            pos_sum = Σ max(err_q, 0)
-            neg_sum = Σ min(err_q, 0)  (<= 0)
-        - 若 pos_sum >= |-neg_sum|，返回 -pos_sum   （负号，便于 topk(largest=False) 选出“正向最强”的行）
-        否则返回  |-neg_sum|        （正号，便于 topk(largest=True) 选出“负向最强”的行）
-        这样不改调用代码也能实现：用“最大正向”去指导“最大负向”。
-        """
+                                              q_L_pt: torch.Tensor, q_U_pt: torch.Tensor, batch_size_records: int,
+                                              query_chunk_size: int) -> torch.Tensor:
+        """计算每条记录的 L∞ 适应度 (即行参与的最大查询误差)"""
         batch_P, num_records, _ = data_pt.shape
         num_queries = q_I_pt.shape[0]
         device = data_pt.device
-
-        # 分块累计（避免显存爆）
+        linf_values = torch.zeros(batch_P, num_records, dtype=torch.float32, device=device)
+        abs_error = torch.abs(error_pt)
         query_chunk_size = max(1, int(query_chunk_size))
-        fitness_values = torch.zeros(batch_P, num_records, dtype=torch.float32, device=device)
 
         for record_start in range(0, num_records, batch_size_records):
             record_end = min(record_start + batch_size_records, num_records)
-            data_batch = data_pt[:, record_start:record_end, :]         # (P, Rb, C)
+            data_batch = data_pt[:, record_start:record_end, :]
             rec_batch = record_end - record_start
-
-            # 对当前记录批的累计器
-            pos_accum = torch.zeros(batch_P, rec_batch, dtype=torch.float32, device=device)
-            neg_accum = torch.zeros(batch_P, rec_batch, dtype=torch.float32, device=device)
+            batch_linf = torch.zeros(batch_P, rec_batch, dtype=torch.float32, device=device)
 
             for query_start in range(0, num_queries, query_chunk_size):
                 query_end = min(query_start + query_chunk_size, num_queries)
-
-                # 当前查询块的列索引与边界
-                q_block = q_I_pt[query_start:query_end]                  # (Qb, k)
+                q_block = q_I_pt[query_start:query_end]
                 flat_ids = q_block.reshape(-1).long()
-
-                # 当前查询块的误差（每个个体各一份）
-                err_block = error_pt[:, query_start:query_end]           # (P, Qb)
-
                 if flat_ids.numel() == 0:
-                    # 空查询（对所有行都命中），把该块的正/负误差和加给所有行
-                    pos_block = torch.clamp_min(err_block, 0.0).sum(dim=1, keepdim=True)  # (P,1)
-                    neg_block = torch.clamp_max(err_block, 0.0).sum(dim=1, keepdim=True)  # (P,1)
-                    pos_accum += pos_block.expand(-1, rec_batch)
-                    neg_accum += neg_block.expand(-1, rec_batch)
+                    max_err = abs_error[:, query_start:query_end].amax(dim=1, keepdim=True)
+                    batch_linf = torch.maximum(batch_linf, max_err.expand(-1, rec_batch))
                     continue
-
-                # 选出该块涉及的所有列，重排成 (P, Rb, Qb, k)
-                gathered = torch.index_select(data_batch, 2, flat_ids)   # (P, Rb, Qb*k)
+                gathered = torch.index_select(data_batch, 2, flat_ids)
                 gathered = gathered.view(batch_P, rec_batch, query_end - query_start, -1)
 
-                lowers = q_L_pt[query_start:query_end].view(1, 1, query_end - query_start, -1)  # (1,1,Qb,k)
-                uppers = q_U_pt[query_start:query_end].view(1, 1, query_end - query_start, -1)  # (1,1,Qb,k)
+                lowers = q_L_pt[query_start:query_end].view(1, 1, query_end - query_start, -1)
+                uppers = q_U_pt[query_start:query_end].view(1, 1, query_end - query_start, -1)
 
-                # φ：记录是否命中每个查询（AND over k）
-                phi_results = torch.all((gathered >= lowers) & (gathered < uppers), dim=3)      # (P, Rb, Qb)
+                phi_results = torch.all((gathered >= lowers) & (gathered < uppers), dim=3)
+                err_block = abs_error[:, query_start:query_end].unsqueeze(1)
+                contribution = phi_results.float() * err_block
+                batch_linf = torch.maximum(batch_linf, contribution.max(dim=2).values)
 
-                # 把正/负误差只加到命中的查询上
-                pos_block = torch.clamp_min(err_block.unsqueeze(1), 0.0)                       # (P,1,Qb)
-                neg_block = torch.clamp_max(err_block.unsqueeze(1), 0.0)                       # (P,1,Qb)
+            linf_values[:, record_start:record_end] = batch_linf
 
-                pos_accum += (phi_results.float() * pos_block).sum(dim=2)                      # (P,Rb)
-                neg_accum += (phi_results.float() * neg_block).sum(dim=2)                      # (P,Rb)
-
-            # 主导侧选择与符号编码
-            neg_mag = -neg_accum                                # (P,Rb)  >=0
-            dominant_is_pos = pos_accum >= neg_mag              # (P,Rb)  True→正向占优
-            dominant_mag = torch.where(dominant_is_pos, pos_accum, neg_mag)
-            # 返回值编码：正向占优→ -pos_sum（≤0）， 负向占优→ +|neg_sum|（≥0）
-            fitness_values[:, record_start:record_end] = torch.where(
-                dominant_is_pos, -dominant_mag, dominant_mag
-            )
-
-        return fitness_values
+        return linf_values
 
     def _calculate_linf_fitness(self, data_pt: torch.Tensor, error_pt: torch.Tensor,
                                 query_cache: dict[torch.device, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
                                 batch_size_records: int, query_chunk_size: int) -> torch.Tensor:
         def worker(chunk: torch.Tensor, device: torch.device, error_chunk: torch.Tensor) -> torch.Tensor:
             q_I_pt, q_U_pt, q_L_pt = query_cache[device]
-            # 注意：单设备函数的签名仍是 (I, L, U) 顺序
             return self._calculate_linf_fitness_single_device(
                 chunk, error_chunk, q_I_pt, q_L_pt, q_U_pt, batch_size_records, query_chunk_size)
 
@@ -567,173 +531,45 @@ class PrivateDEGeneratorPT:
             rows[:, col_idx] = new_values
 
     def _apply_targeted_mutations(self, decoded_population: torch.Tensor, global_error: torch.Tensor,
-                                q_I_pt: torch.Tensor, q_L_pt: torch.Tensor,
-                                q_U_pt: torch.Tensor, replacement_batch_size: int, num_records: int,
-                                aggressive_queries_mask: torch.Tensor, aggressive_multiplier: float) -> torch.Tensor:
-        """
-        供需转移突变（保持签名不变）：
-        - 对正向误差查询 q+：优先从负向误差查询 q- 的命中行中“抽取供给”，对这些行先 inside(q+) 再 outside(q-非重叠列)。
-        若没有可用 q- 或候选不足，则回退为 inside(q+)。
-        - 对负向误差查询 q-：保持原有 outside(q-)。
-        - 每代最多修改 replacement_batch_size 行（每个个体）。
-        - desired ≈ |err_q| * num_records，并对 aggressive 查询按 aggressive_multiplier 放大。
-        """
+                                  q_I_pt: torch.Tensor, q_L_pt: torch.Tensor,
+                                  q_U_pt: torch.Tensor, replacement_batch_size: int, num_records: int,
+                                  aggressive_queries_mask: torch.Tensor, aggressive_multiplier: float) -> torch.Tensor:
         batch_P, _, _ = decoded_population.shape
         num_queries = global_error.shape[1]
-
         for pop_idx in range(batch_P):
-            errors = global_error[pop_idx]  # (Q,)
-            abs_errors = torch.abs(errors)
-
-            # 按误差绝对值降序遍历查询（与原逻辑一致）
-            _, sorted_queries = torch.sort(abs_errors, descending=True)
-
-            # 预先按“供给强度”排序负侧查询（|err| 大在前）
-            neg_mask = errors < 0
-            if torch.any(neg_mask):
-                neg_indices = torch.nonzero(neg_mask, as_tuple=False).squeeze(1)
-                neg_sorted = neg_indices[torch.argsort(torch.abs(errors[neg_indices]), descending=True)]
-            else:
-                neg_sorted = torch.empty(0, dtype=torch.long, device=errors.device)
-
-            # 跟踪每个负侧查询已“用掉”的供给行数（避免一次性抽空）
-            supply_used = torch.zeros(num_queries, dtype=torch.int32, device=errors.device)
-
+            errors = global_error[pop_idx]
+            _, sorted_queries = torch.sort(torch.abs(errors), descending=True)
             rows_changed = 0
-
             for q_rank in range(num_queries):
-                if rows_changed >= replacement_batch_size:
-                    break
-
                 q_idx = int(sorted_queries[q_rank].item())
                 err_val = float(errors[q_idx].item())
                 if abs(err_val) < 1e-8:
                     continue
-
-                col_ids_pos = q_I_pt[q_idx]
-                lowers_pos = q_L_pt[q_idx]
-                uppers_pos = q_U_pt[q_idx]
-                is_aggr_pos = bool(aggressive_queries_mask[q_idx].item())
-
-                # 本查询希望更新的行数上限
+                col_ids = q_I_pt[q_idx]
+                lowers = q_L_pt[q_idx]
+                uppers = q_U_pt[q_idx]
+                satisfied_mask = self._evaluate_query_mask_rows(decoded_population[pop_idx], col_ids, lowers, uppers)
+                candidate_mask = (~satisfied_mask) if err_val > 0 else satisfied_mask
+                candidate_indices = torch.nonzero(candidate_mask, as_tuple=False).squeeze(1)
+                if candidate_indices.numel() == 0:
+                    continue
                 desired = max(1, int(abs(err_val) * num_records))
-                if is_aggr_pos:
+                if aggressive_queries_mask[q_idx].item():
                     desired = max(desired, int(desired * aggressive_multiplier))
-                remaining_global = replacement_batch_size - rows_changed
-                if remaining_global <= 0:
+                remaining = replacement_batch_size - rows_changed
+                if remaining <= 0:
                     break
-                desired = min(desired, remaining_global)
-
-                if err_val > 0:
-                    # -------- 正向误差：优先做“供需转移” --------
-                    # 需要的候选：当前不满足 q+ 的行
-                    satisfied_pos = self._evaluate_query_mask_rows(decoded_population[pop_idx], col_ids_pos, lowers_pos, uppers_pos)
-                    need_mask = ~satisfied_pos  # 这些行需要被推到 q+ 里
-                    if need_mask.any():
-                        assigned = 0
-
-                        # 1) 从负向误差查询中“抽供给”，做双重突变：inside(q+) + outside(q-非重叠列)
-                        for neg_q in neg_sorted:
-                            if assigned >= desired:
-                                break
-                            neg_qi = int(neg_q.item())
-
-                            # 该负向查询尚有“可用供给”吗？
-                            neg_err_mag = int(abs(float(errors[neg_qi].item())) * num_records)
-                            neg_left = max(0, neg_err_mag - int(supply_used[neg_qi].item()))
-                            if neg_left <= 0:
-                                continue
-
-                            col_ids_neg = q_I_pt[neg_qi]
-                            lowers_neg = q_L_pt[neg_qi]
-                            uppers_neg = q_U_pt[neg_qi]
-                            is_aggr_neg = bool(aggressive_queries_mask[neg_qi].item())
-
-                            # 候选：命中 q- 且不命中 q+
-                            satisfied_neg = self._evaluate_query_mask_rows(decoded_population[pop_idx], col_ids_neg, lowers_neg, uppers_neg)
-                            candidate_mask = need_mask & satisfied_neg
-                            candidate_indices = torch.nonzero(candidate_mask, as_tuple=False).squeeze(1)
-                            if candidate_indices.numel() == 0:
-                                continue
-
-                            take = min(desired - assigned, neg_left, int(candidate_indices.numel()))
-                            if take <= 0:
-                                continue
-
-                            perm = torch.randperm(candidate_indices.numel(), device=candidate_indices.device)[:take]
-                            chosen_indices = candidate_indices[perm]
-
-                            rows_to_mutate = decoded_population[pop_idx].index_select(0, chosen_indices)
-
-                            # inside(q+): 让这些行满足 q+
-                            self._mutate_rows_to_interval_batch(rows_to_mutate, col_ids_pos, lowers_pos, uppers_pos,
-                                                                make_inside=True, aggressive=is_aggr_pos)
-
-                            # outside(q- 非重叠列)：避免破坏 q+，只动 q- 中“未在 q+ 出现”的列
-                            with torch.no_grad():
-                                valid_neg = (col_ids_neg >= 0)
-                                valid_pos = (col_ids_pos >= 0)
-                                if valid_neg.any():
-                                    if valid_pos.any():
-                                        # (k_neg, k_pos) 比较，找出 q- 中未出现在 q+ 的列位置
-                                        membership = (col_ids_neg.view(-1, 1) == col_ids_pos.view(1, -1))
-                                        overlap_any = membership.any(dim=1)
-                                        neg_only_mask = valid_neg & (~overlap_any)
-                                    else:
-                                        neg_only_mask = valid_neg
-                                else:
-                                    neg_only_mask = torch.zeros_like(col_ids_neg, dtype=torch.bool)
-
-                            if neg_only_mask.any():
-                                col_ids_neg_masked = col_ids_neg.clone()
-                                # 非激活列置为 -1，_mutate_rows_to_interval_batch 会跳过
-                                col_ids_neg_masked[~neg_only_mask] = -1
-                                self._mutate_rows_to_interval_batch(rows_to_mutate, col_ids_neg_masked, lowers_neg, uppers_neg,
-                                                                    make_inside=False, aggressive=is_aggr_neg)
-                            # 若完全重叠则跳过 outside(q-)，以免破坏刚刚建立的 q+ 命中
-
-                            # 写回
-                            decoded_population[pop_idx].index_copy_(0, chosen_indices, rows_to_mutate)
-
-                            assigned += take
-                            rows_changed += take
-                            supply_used[neg_qi] += int(take)
-
-                        # 2) 若仍未满足 desired，用普通 inside(q+) 补齐
-                        if assigned < desired:
-                            fallback_indices = torch.nonzero(need_mask, as_tuple=False).squeeze(1)
-                            if fallback_indices.numel() > 0:
-                                take = min(desired - assigned, int(fallback_indices.numel()))
-                                perm = torch.randperm(fallback_indices.numel(), device=fallback_indices.device)[:take]
-                                chosen_indices = fallback_indices[perm]
-                                rows_to_mutate = decoded_population[pop_idx].index_select(0, chosen_indices)
-                                self._mutate_rows_to_interval_batch(rows_to_mutate, col_ids_pos, lowers_pos, uppers_pos,
-                                                                    make_inside=True, aggressive=is_aggr_pos)
-                                decoded_population[pop_idx].index_copy_(0, chosen_indices, rows_to_mutate)
-                                rows_changed += int(take)
-
-                    # 若 need_mask 全 False（少见，表示该 q+ 已几乎满足），则跳过
-
-                else:
-                    # -------- 负向误差：沿用原 outside（把命中的行推出去） --------
-                    col_ids_neg = col_ids_pos
-                    lowers_neg = lowers_pos
-                    uppers_neg = uppers_pos
-                    is_aggr_neg = is_aggr_pos
-
-                    satisfied_neg = self._evaluate_query_mask_rows(decoded_population[pop_idx], col_ids_neg, lowers_neg, uppers_neg)
-                    candidate_indices = torch.nonzero(satisfied_neg, as_tuple=False).squeeze(1)
-                    if candidate_indices.numel() == 0:
-                        continue
-                    take = min(desired, int(candidate_indices.numel()))
-                    perm = torch.randperm(candidate_indices.numel(), device=candidate_indices.device)[:take]
-                    chosen_indices = candidate_indices[perm]
-                    rows_to_mutate = decoded_population[pop_idx].index_select(0, chosen_indices)
-                    self._mutate_rows_to_interval_batch(rows_to_mutate, col_ids_neg, lowers_neg, uppers_neg,
-                                                        make_inside=False, aggressive=is_aggr_neg)
-                    decoded_population[pop_idx].index_copy_(0, chosen_indices, rows_to_mutate)
-                    rows_changed += int(take)
-
+                num_updates = min(desired, remaining, candidate_indices.numel())
+                perm = torch.randperm(candidate_indices.numel(), device=candidate_indices.device)[:num_updates]
+                chosen_indices = candidate_indices[perm]
+                rows_to_mutate = decoded_population[pop_idx].index_select(0, chosen_indices)
+                self._mutate_rows_to_interval_batch(rows_to_mutate, col_ids, lowers, uppers,
+                                                    make_inside=(err_val > 0),
+                                                    aggressive=bool(aggressive_queries_mask[q_idx].item()))
+                decoded_population[pop_idx].index_copy_(0, chosen_indices, rows_to_mutate)
+                rows_changed += num_updates
+                if rows_changed >= replacement_batch_size:
+                    break
         return decoded_population
 
     def _inject_diversity(self, population_norm: torch.Tensor, best_population_norm: torch.Tensor,
@@ -745,80 +581,6 @@ class PrivateDEGeneratorPT:
         mixed = 0.5 * population_norm[worst_indices] + 0.5 * blended_best + jitter
         population_norm[worst_indices] = torch.clamp(mixed, -1.0, 1.0)
         return population_norm
-
-    def _row_pos_neg_sums_single_device(self, data_pt: torch.Tensor, error_pt: torch.Tensor, q_I_pt: torch.Tensor,
-                                        q_L_pt: torch.Tensor, q_U_pt: torch.Tensor,
-                                        batch_size_records: int, query_chunk_size: int) -> torch.Tensor:
-        """
-        返回形状 (batch_P, num_records, 2) 的张量：
-        [..., 0] = pos_sum = Σ 命中查询的 max(err, 0)
-        [..., 1] = neg_mag = Σ 命中查询的 max(-err, 0)
-        """
-        batch_P, num_records, _ = data_pt.shape
-        num_queries = q_I_pt.shape[0]
-        device = data_pt.device
-
-        query_chunk_size = max(1, int(query_chunk_size))
-        # 累计器
-        pos_accum = torch.zeros(batch_P, num_records, dtype=torch.float32, device=device)
-        neg_accum = torch.zeros(batch_P, num_records, dtype=torch.float32, device=device)
-
-        for record_start in range(0, num_records, batch_size_records):
-            record_end = min(record_start + batch_size_records, num_records)
-            data_batch = data_pt[:, record_start:record_end, :]  # (P, Rb, C)
-            rec_batch = record_end - record_start
-
-            pos_local = torch.zeros(batch_P, rec_batch, dtype=torch.float32, device=device)
-            neg_local = torch.zeros(batch_P, rec_batch, dtype=torch.float32, device=device)
-
-            for query_start in range(0, num_queries, query_chunk_size):
-                query_end = min(query_start + query_chunk_size, num_queries)
-
-                q_block = q_I_pt[query_start:query_end]   # (Qb, k)
-                flat_ids = q_block.reshape(-1).long()
-
-                err_block = error_pt[:, query_start:query_end]              # (P, Qb)
-                pos_block = torch.clamp_min(err_block, 0.0).unsqueeze(1)    # (P,1,Qb)
-                neg_block = torch.clamp_min(-err_block, 0.0).unsqueeze(1)   # (P,1,Qb)
-
-                if flat_ids.numel() == 0:
-                    pos_local += pos_block.sum(dim=2).expand(-1, rec_batch)
-                    neg_local += neg_block.sum(dim=2).expand(-1, rec_batch)
-                    continue
-
-                gathered = torch.index_select(data_batch, 2, flat_ids)      # (P, Rb, Qb*k)
-                gathered = gathered.view(batch_P, rec_batch, query_end - query_start, -1)
-
-                lowers = q_L_pt[query_start:query_end].view(1, 1, -1, q_L_pt.shape[1])
-                uppers = q_U_pt[query_start:query_end].view(1, 1, -1, q_U_pt.shape[1])
-
-                phi = torch.all((gathered >= lowers) & (gathered < uppers), dim=3)  # (P, Rb, Qb)
-
-                pos_local += (phi.float() * pos_block).sum(dim=2)
-                neg_local += (phi.float() * neg_block).sum(dim=2)
-
-            pos_accum[:, record_start:record_end] = pos_local
-            neg_accum[:, record_start:record_end] = neg_local
-
-        # 打包为 (P, N, 2)
-        return torch.stack([pos_accum, neg_accum], dim=2)
-
-
-    def _row_pos_neg_sums(self, data_pt: torch.Tensor, error_pt: torch.Tensor,
-                        query_cache: dict[torch.device, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-                        batch_size_records: int, query_chunk_size: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        多设备封装，返回：
-        pos_sums: (P, N) ，neg_mags: (P, N)
-        """
-        def worker(chunk: torch.Tensor, device: torch.device, error_chunk: torch.Tensor) -> torch.Tensor:
-            q_I_pt, q_U_pt, q_L_pt = query_cache[device]
-            return self._row_pos_neg_sums_single_device(
-                chunk, error_chunk, q_I_pt, q_L_pt, q_U_pt, batch_size_records, query_chunk_size
-            )  # (Pk, Rb, 2)
-
-        packed = self._apply_per_device(data_pt, worker, paired_tensors=[error_pt])  # (P, N, 2)
-        return packed[..., 0], packed[..., 1]
 
     def _run_evolution(self, key, initial_population, noised_answers, queries, k, num_records, G, P,
                        fitness_batch_size, query_chunk_size, replacement_batch_size, crossover_rate, crossover_num_rows,
@@ -923,47 +685,22 @@ class PrivateDEGeneratorPT:
             if crossover_rate > 0 and P > 1:
                 decoded_best = self._decode_pt(best_overall_population.unsqueeze(0))
                 best_answers = self._calculate_answers_batched(decoded_best, query_cache,
-                                                            fitness_batch_size, query_chunk_size,
-                                                            normalize_by=num_records)
+                                                               fitness_batch_size, query_chunk_size,
+                                                               normalize_by=num_records)
                 best_global_error = noised_answers_pt - best_answers
-
-                # 行级分解：pos_sum / neg_mag
-                best_pos, best_neg = self._row_pos_neg_sums(decoded_best, best_global_error, query_cache,
-                                                            fitness_batch_size, query_chunk_size)
-                pop_pos,  pop_neg  = self._row_pos_neg_sums(evolved_decoded_pop, updated_global_error, query_cache,
-                                                            fitness_batch_size, query_chunk_size)
-
-                fallback_gamma = 1e-8
-                neg_dom_any = torch.any(pop_neg > pop_pos + fallback_gamma) or torch.any(best_neg > best_pos + fallback_gamma)
+                best_linf_fitness = self._calculate_linf_fitness(
+                    decoded_best, best_global_error, query_cache,
+                    fitness_batch_size, query_chunk_size).squeeze(0)
+                _, elite_indices = torch.topk(best_linf_fitness, crossover_num_rows, largest=False)
 
                 num_to_crossover = int(P * crossover_rate)
                 _, worst_pop_indices = torch.topk(current_global_errors, num_to_crossover, largest=True)
 
-                if neg_dom_any:
-                    # —— 原策略：最大负向 ← 最大正向（利用你当前的行级“符号占优和”适应度）
-                    best_row_fit = self._calculate_linf_fitness(
-                        decoded_best, best_global_error, query_cache, fitness_batch_size, query_chunk_size
-                    ).squeeze(0)  # (N,)
-                    _, elite_indices = torch.topk(best_row_fit, crossover_num_rows, largest=False)  # 正向最强（值更小）
-
-                    for pop_idx in worst_pop_indices:
-                        if pop_idx == best_current_idx:
-                            continue
-                        # 受体：该个体里“负向最强”的行
-                        _, worst_record_indices = torch.topk(linf_fitness[pop_idx], crossover_num_rows, largest=True)
-                        population_norm[pop_idx, worst_record_indices, :] = best_overall_population[elite_indices, :]
-
-                else:
-                    # —— 兜底策略：全体正向占优
-                    # 供体：best 个体里 “命中正缺口最多”的行（pos_sum 最大）
-                    _, elite_indices = torch.topk(best_pos.squeeze(0), crossover_num_rows, largest=True)
-
-                    for pop_idx in worst_pop_indices:
-                        if pop_idx == best_current_idx:
-                            continue
-                        # 受体：该个体里 “命中正缺口最少”的行（pos_sum 最小）
-                        _, worst_record_indices = torch.topk(pop_pos[pop_idx], crossover_num_rows, largest=False)
-                        population_norm[pop_idx, worst_record_indices, :] = best_overall_population[elite_indices, :]
+                for pop_idx in worst_pop_indices:
+                    if pop_idx == best_current_idx:
+                        continue
+                    _, worst_record_indices = torch.topk(linf_fitness[pop_idx], crossover_num_rows, largest=True)
+                    population_norm[pop_idx, worst_record_indices, :] = best_overall_population[elite_indices, :]
 
             if stagnation_counter >= stagnation_patience:
                 num_diverse = max(1, int(P * diversity_fraction))
@@ -1026,7 +763,7 @@ def main():
     parser.add_argument('-P', '--population_size', type=int, default=100)
     parser.add_argument('-G', type=int, default=50000, help="演化世代数。")
     parser.add_argument('--fitness_batch_size', type=int, default=1024, help="计算适应度时的记录批处理大小。")
-    parser.add_argument('--replacement_batch_size', type=int, default=100, help="每代中被替换的记录数量。")
+    parser.add_argument('--replacement_batch_size', type=int, default=256, help="每代中被替换的记录数量。")
     parser.add_argument('--crossover_rate', type=float, default=0.5)
     parser.add_argument('--crossover_num_rows', type=int, default=50)
     parser.add_argument('--seed', type=int, default=42)
@@ -1034,19 +771,19 @@ def main():
     parser.add_argument('--diversity_fraction', type=float, default=0.2, help="触发多样性注入时需要重采样的人口比例。")
     parser.add_argument('--diversity_jitter', type=float, default=1, help="多样性注入时在 [-1,1] 空间施加的随机扰动幅度。")
     parser.add_argument('--mutation_growth', type=float, default=0.3, help="停滞时放大 replacement_batch_size 的增长系数。")
-    parser.add_argument('--min_effective_replacement', type=int, default=10, help="针对性突变时的最小替换行数下限。")
+    parser.add_argument('--min_effective_replacement', type=int, default=128, help="针对性突变时的最小替换行数下限。")
     parser.add_argument('--improvement_tolerance', type=float, default=1e-4, help="判定出现有效改进所需的 L2 阈值。")
     parser.add_argument('--aggressive_query_patience', type=int, default=3, help="单个查询在连续多少代没有明显改善后进入强化突变模式。")
     parser.add_argument('--aggressive_query_multiplier', type=float, default=2.0, help="强化突变模式下单个查询的替换行数放大倍率。")
     parser.add_argument('--query_improvement_tolerance', type=float, default=1e-4, help="判定单个查询误差得到改善所需的最小幅度。")
     parser.add_argument('--aggressive_replacement_boost', type=float, default=0.5, help="存在强化突变查询时额外放大的替换行数比例。")
-    parser.add_argument('--query_chunk_size', type=int, default=320000, help="按查询分块进行批处理时的块大小，较小值可显著降低显存占用。")
+    parser.add_argument('--query_chunk_size', type=int, default=32000, help="按查询分块进行批处理时的块大小，较小值可显著降低显存占用。")
     parser.add_argument('--device', type=str, default='auto',
                         help="要使用的计算设备。可选: 'auto' (默认, 自动使用所有 GPU), 'cpu', 或逗号分隔的 cuda:id 列表。")
 
     args = parser.parse_args(args=['--input', '/home/qianqiu/experiment-trade/private_gsd/generate_script/source/acs.csv',
                                    '--output', './synthetic_acs.csv',
-                                   '--population_size', '2'])
+                                   '--population_size', '1'])
 
     if not os.path.exists(args.input):
         print(f"错误: 输入文件 '{args.input}' 不存在。"); return
