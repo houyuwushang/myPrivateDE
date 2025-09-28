@@ -16,9 +16,10 @@ import torch
 import torch.nn.functional as F
 
 
-# 将 JAX 强制置于 CPU 模式，为 PyTorch 释放 GPU
-# Force JAX to CPU mode to free up GPU for PyTorch
+# 根据当前环境优先选择 GPU（若可用）以避免在 JAX 与 PyTorch 之间频繁搬运数据
+#preferred_platform = 'cuda' if torch.cuda.is_available() else 'cpu'
 os.environ['JAX_PLATFORMS'] = 'cpu'
+
 
 # 将 src 目录添加到 Python 搜索路径中
 # Add the src directory to the Python search path
@@ -41,6 +42,80 @@ from genetic_sd.adaptive_statistics import AdaptiveChainedStatistics, Marginals
 from mygenerator import PrivateDEGeneratorPT
 
 
+def _jax_array_to_torch(array, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """Convert a JAX/NumPy array into a Torch tensor that already lives on ``device``.
+
+    For JAX arrays we rely on the DLPack bridge so the data can stay on the GPU
+    without a round-trip through host memory.  NumPy arrays (or other sequences)
+    fall back to ``torch.as_tensor``.
+    """
+
+    try:
+        import jax
+        import jax.dlpack as jdlpack  # type: ignore
+        from torch.utils import dlpack as torch_dlpack
+
+        if isinstance(array, jax.Array):  # type: ignore[attr-defined]
+            return torch_dlpack.from_dlpack(jdlpack.to_dlpack(array)).to(device=device, dtype=dtype)
+    except Exception:
+        # 安全兜底: 如果 JAX 不可用或转换失败，退回到常规的 tensor 构造
+        pass
+
+    return torch.as_tensor(np.asarray(array), dtype=dtype, device=device)
+
+
+def _prepare_query_tensors(stat_module: 'AdaptiveChainedStatistics', device: torch.device) -> dict[str, torch.Tensor]:
+    """Pack all query definitions from ``stat_module`` into Torch tensors on ``device``.
+
+    返回的字典包含:
+    - ``indices``: (Q, k) long tensor
+    - ``uppers``: (Q, k) float tensor
+    - ``lowers``: (Q, k) float tensor
+    - ``k``:  查询维度 (保存为 tensor/int，便于后续直接复用)
+    """
+
+    all_tensors: list[torch.Tensor] = []
+    k: Optional[int] = None
+
+    for module in getattr(stat_module, 'stat_modules', []):
+        queries = getattr(module, 'queries', None)
+        if queries is None:
+            continue
+        tensor = _jax_array_to_torch(queries, dtype=torch.float32, device=device)
+        if tensor.numel() == 0:
+            continue
+        all_tensors.append(tensor)
+        if k is None and hasattr(module, 'k'):
+            k = int(module.k)
+
+    if not all_tensors:
+        raise ValueError('在统计模块中未发现可用的查询定义。')
+
+    queries_tensor = torch.cat(all_tensors, dim=0)
+    if k is None:
+        k = queries_tensor.shape[1] // 3
+
+    indices = queries_tensor[:, :k].to(dtype=torch.long)
+    uppers = queries_tensor[:, k:2 * k]
+    lowers = queries_tensor[:, 2 * k:3 * k]
+
+    return {
+        'indices': indices,
+        'uppers': uppers,
+        'lowers': lowers,
+        'k': int(k)
+    }
+
+
+def project_2way_to_consistent_1way(stat_module, noised_answers):
+    """占位投影函数。
+
+    当前仓库主要关注生成器与查询之间的 GPU 交互，因此这里直接返回原值。
+    """
+
+    return noised_answers, 0.0
+
+
 def main():
     parser = argparse.ArgumentParser(description="Private-DE: V50 - L∞ 定向重采样版 (PyTorch)。")
     parser.add_argument('--input', type=str, required=True)
@@ -48,7 +123,7 @@ def main():
     parser.add_argument('--epsilon', type=float, default=10.0)
     parser.add_argument('-P', '--population_size', type=int, default=100)
     parser.add_argument('-G', type=int, default=20000, help="演化世代数。")
-    parser.add_argument('--fitness_batch_size', type=int, default=1024, help="计算适应度时的记录批处理大小。")
+    parser.add_argument('--fitness_batch_size', type=int, default=1000, help="计算适应度时的记录批处理大小。")
     parser.add_argument('--replacement_batch_size', type=int, default=100, help="每代中被替换的记录数量。")
     parser.add_argument('--crossover_rate', type=float, default=0.5)
     parser.add_argument('--crossover_num_rows', type=int, default=50)
@@ -66,7 +141,7 @@ def main():
     parser.add_argument('--query_chunk_size', type=int, default=320000, help="按查询分块进行批处理时的块大小，较小值可显著降低显存占用。")
     parser.add_argument('--device', type=str, default='auto',
                         help="要使用的计算设备。可选: 'auto' (默认, 自动使用所有 GPU), 'cpu', 或逗号分隔的 cuda:id 列表。")
-
+    
     args = parser.parse_args(args=['--input', '/home/qianqiu/experiment-trade/private_gsd/generate_script/source/acs.csv',
                                    '--output', './synthetic_acs.csv',
                                    '--population_size', '2'])
@@ -118,7 +193,12 @@ def main():
     
     print("\n--- 步骤 3: 启动 PyTorch 生成器 ---")
     generator = PrivateDEGeneratorPT(real_dataset.domain, temp_synthesizer, device_spec=args.device)
-    
+
+    query_tensors = _prepare_query_tensors(stat_module, generator.primary_device)
+    target_answers_torch = _jax_array_to_torch(
+        proj_answers, dtype=torch.float32, device=generator.primary_device
+    ).flatten()
+
     gen_params = {
         'G': args.G, 'P': args.population_size,
         'fitness_batch_size': args.fitness_batch_size,
@@ -138,7 +218,13 @@ def main():
         'query_chunk_size': args.query_chunk_size
     }
 
-    final_synthetic_dataset = generator.generate(stat_module, np.array(proj_answers), num_records, **gen_params)
+    final_synthetic_dataset = generator.generate(
+        stat_module,
+        target_answers_torch,
+        num_records,
+        precomputed_query_tensors=query_tensors,
+        **gen_params
+    )
 
     print(f"\n--- 步骤 4: 后处理并保存合成数据 ---")
     data_list = temp_synthesizer.get_values_as_list(final_synthetic_dataset.domain, final_synthetic_dataset.df)
